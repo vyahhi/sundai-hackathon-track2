@@ -60,5 +60,5 @@ cuda-challenge/
     kernel.cu           # YOUR CUDA kernels
     pybind.cpp          # Python bindings
   optimized/            # High-performance nunchaku-based baseline
-  flux_dump/            # Generated data (from dump_data.py)
+  flux_dump/            # Generated data (run download_data.py)
 ```
