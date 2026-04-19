@@ -696,9 +696,9 @@ torch::Tensor gemm_int4_custom(
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
     const bool use_direct_layout_4w = (group_size == BLOCK_K) &&
-                                      (M % DIRECT4_BLOCK_M == 0) &&
-                                      (N % BLOCK_N == 0) &&
-                                      (K % BLOCK_K == 0);
+                                      (K == 3072) &&
+                                      (N == 3072) &&
+                                      (M % DIRECT4_BLOCK_M == 0);
     const bool use_direct_layout = (group_size == BLOCK_K) &&
                                    (M % DIRECT_BLOCK_M == 0) &&
                                    (N % BLOCK_N == 0) &&
