@@ -719,7 +719,7 @@ torch::Tensor gemm_int4_custom(
 
     const bool use_direct_layout_4w = (group_size_A == BLOCK_K) &&
                                       (group_size_B % BLOCK_K == 0) &&
-                                      ((N == 3072) || ((N == 9216) && (K == 3072))) &&
+                                      ((N == 3072) || (K == 3072)) &&
                                       (M % DIRECT4_BLOCK_M == 0);
     const bool use_direct_layout = (group_size_A == BLOCK_K) &&
                                    (group_size_B % BLOCK_K == 0) &&
