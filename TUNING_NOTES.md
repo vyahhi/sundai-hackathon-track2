@@ -4,24 +4,50 @@ Measured on the remote RTX A6000 benchmark box.
 
 ## Current honest baseline
 
-- Best fair pushed version so far: `50b08b6`
-- Score: `319.39 TOPs`
+- Best fair pushed version so far: `95299e5`
+- Score: `324.07 TOPs`
 - Per-layer:
-  - `attn_to_qkv`: `324.02 TOPs`
-  - `attn_to_out`: `300.79 TOPs`
-  - `ff_up`: `317.22 TOPs`
-  - `ff_down`: `335.54 TOPs`
+  - `attn_to_qkv`: `329.20 TOPs`
+  - `attn_to_out`: `313.27 TOPs`
+  - `ff_up`: `321.95 TOPs`
+  - `ff_down`: `331.86 TOPs`
 
 This version uses:
 
 - The direct INT4 path with `half2` accumulation as the main fast path
 - The 4-warp direct kernel for all benchmarked `K=3072` or `N=3072` shapes
 - Warp-shuffle loads for `scales_A` inside the 4-warp kernel instead of per-tile shared-memory staging
-- Aggressive per-shape offline weight groups:
-  - `attn_to_qkv`: `g512`
-  - `attn_to_out`: `g256`
-  - `ff_up`: `g768`
-  - `ff_down`: `g1536`
+- Rowwise / maximum-size weight scales:
+  - `attn_to_qkv`: `g3072`
+  - `attn_to_out`: `g3072`
+  - `ff_up`: `g3072`
+  - `ff_down`: `g12288`
+- Wider offline clipping search:
+  - `0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.84, 0.88, 0.91, 0.94, 0.97, 1.00`
+
+## Nsight Compute snapshot
+
+Profiled on the remote RTX A6000 with:
+
+```bash
+ncu --target-processes all --set basic --kernel-name-base demangled \
+    --kernel-name regex:gemm_int4_direct_kernel_4w python benchmark.py --warmup 1 --iters 1
+```
+
+Key findings from the current best direct 4-warp kernel:
+
+- Registers per thread: `128`
+- Theoretical occupancy: `33.33%`
+- Achieved occupancy: about `28%` to `32%`
+- Compute throughput: about `53%` to `57%`
+- Memory throughput: about `56%` to `75%`
+- Small-grid `N=3072` launches show a visible tail effect; Nsight estimated roughly `33%` speedup headroom from better wave packing on some `24 x 32` grids
+
+Interpretation:
+
+- The current 4-warp kernel is register-limited first
+- It is also not purely compute-bound; memory traffic is still substantial
+- `attn_to_out` is the most natural target because it combines the smallest useful grid with the weakest TOPs in the current best build
 
 ## Negative findings
 
@@ -67,6 +93,35 @@ This version uses:
 - `__launch_bounds__` on the direct kernel:
   - Catastrophic regression to about `34 TOPs`
   - Likely forced a very bad register/occupancy tradeoff
+
+- Reintroducing the old 8-warp direct kernel for the large-`N` `K=3072` layers while keeping 4-warp only on `N=3072`:
+  - Short fair run landed around `321.26 TOPs`
+  - Per-layer:
+    - `attn_to_qkv`: `308.57 TOPs`
+    - `attn_to_out`: `331.13 TOPs`
+    - `ff_up`: `307.53 TOPs`
+    - `ff_down`: `337.80 TOPs`
+  - Conclusion:
+    - Better `attn_to_out` and `ff_down`
+    - Too much regression on `attn_to_qkv` and `ff_up`
+    - Keep the broader 4-warp dispatch
+
+- Coarser activation groups in the online quantizer:
+  - Diagnostic fallback run with `g128` for `K=3072` and `g256` for `K=12288` landed at:
+    - `attn_to_qkv cosine = 0.986475`
+    - `attn_to_out cosine = 0.991347`
+    - `ff_up cosine = 0.974015`
+    - `ff_down cosine = 0.956597`
+  - Conclusion:
+    - `attn_to_out` can barely tolerate coarser activation scales
+    - `attn_to_qkv`, `ff_up`, and especially `ff_down` cannot
+    - Activation group sizes above `64` are not a viable path unless the quantizer itself changes materially
+
+- 2-warp direct kernel attempt for `attn_to_out`:
+  - Still produced `NaN`s even after fixing the obvious `shared_scales_B` load bug for 64 threads
+  - Conclusion:
+    - The failure is deeper than the scale-staging bug
+    - Do not keep poking this version without a smaller standalone debug harness
 
 ## Recent fair iterations after `e503542`
 
@@ -226,11 +281,11 @@ These are newer dead ends or marginal directions that should not be repeated wit
 
 ## What looks most promising next
 
-- `attn_to_out` is now the laggard layer in the best build
+- `attn_to_out` is still the laggard layer in the best build
 - The most credible next fair wins are kernel-side, not quantization-side:
-  - Improve the 4-warp direct kernel for the `3072 x 3072` case specifically
-  - Reduce remaining synchronization or scale-lookup overhead in the direct path
-  - Try a shape-specific `attn_to_out` path that is different from the generic all-shapes 4-warp kernel
+  - Reduce register pressure in the 4-warp direct kernel without spilling
+  - Improve the small-grid `N=3072` path without falling back into the broken 2-warp branch
+  - Target memory traffic in the direct kernel rather than pushing weight grouping harder
 
 ## Benchmark structure reminder
 
