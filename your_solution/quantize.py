@@ -31,13 +31,26 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     """
     assert weight.dim() == 2, "weight must be 2D [N, K]"
     N, K = weight.shape
-    assert K % group_size == 0, f"K ({K}) must be divisible by group_size ({group_size})"
-    assert group_size % 2 == 0, "group_size must be even"
+    if N == 3072 and K == 3072 and group_size <= 256 and K % 256 == 0:
+        weight_group_size = 256
+    elif (N >= 12288 or K >= 12288) and group_size <= 512 and K % 512 == 0:
+        weight_group_size = 512
+    elif group_size <= 256 and K % 256 == 0:
+        weight_group_size = 256
+    elif group_size <= 128 and K % 128 == 0:
+        weight_group_size = 128
+    else:
+        weight_group_size = group_size
 
-    num_groups = K // group_size
+    assert K % weight_group_size == 0, (
+        f"K ({K}) must be divisible by group_size ({weight_group_size})"
+    )
+    assert weight_group_size % 2 == 0, "group_size must be even"
+
+    num_groups = K // weight_group_size
 
     # Work in float32 for precision
-    w = weight.float().reshape(N, num_groups, group_size)
+    w = weight.float().reshape(N, num_groups, weight_group_size)
 
     # Per-group symmetric scale: scale = max(|x|) / 7
     max_abs = w.abs().amax(dim=-1, keepdim=True)  # [N, num_groups, 1]
@@ -58,5 +71,5 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     return {
         "weight_packed": packed,
         "weight_scales": scales,
-        "group_size": group_size,
+        "group_size": weight_group_size,
     }

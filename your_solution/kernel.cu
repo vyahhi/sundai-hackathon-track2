@@ -281,7 +281,8 @@ __global__ void gemm_int4_direct_kernel(
     half* __restrict__ C,
     int M,
     int N,
-    int num_k_tiles
+    int num_k_tiles,
+    int num_groups_B
 ) {
     const int bn = blockIdx.x;
     const int bm = blockIdx.y;
@@ -302,73 +303,79 @@ __global__ void gemm_int4_direct_kernel(
         }
     }
 
-    for (int kt = 0; kt < num_k_tiles; kt++) {
-        if (tid < DIRECT_BLOCK_M) {
-            shared_scales_A[tid] = scales_A[(bm * DIRECT_BLOCK_M + tid) * num_k_tiles + kt];
-        }
-        if (tid < BLOCK_N) {
-            shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_k_tiles + kt];
+    const int b_scale_stride = num_k_tiles / num_groups_B;
+    for (int bg = 0; bg < num_groups_B; bg++) {
+        for (int i = tid; i < BLOCK_N; i += WARP_SZ * DIRECT4_NUM_WARPS) {
+            shared_scales_B[i] = scales_B[(bn * BLOCK_N + i) * num_groups_B + bg];
         }
         __syncthreads();
 
-        uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 0) * WARP_SZ + laneId]);
-        uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 1) * WARP_SZ + laneId]);
+        for (int sub = 0; sub < b_scale_stride; sub++) {
+            const int kt = bg * b_scale_stride + sub;
+            if (tid < DIRECT_BLOCK_M) {
+                shared_scales_A[tid] = scales_A[(bm * DIRECT_BLOCK_M + tid) * num_k_tiles + kt];
+            }
+            __syncthreads();
 
-        const int row = laneId / 4;
-        const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row],
-                                         shared_scales_A[warpId * DIRECT_WARP_M + row]);
-        const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 8],
-                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 8]);
-        const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 16],
-                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
-        const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 24],
-                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
+            uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 0) * WARP_SZ + laneId]);
+            uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 1) * WARP_SZ + laneId]);
 
-        #pragma unroll
-        for (int nt = 0; nt < TILES_N; nt++) {
-            uint4 wf = load_u4(&B[((bn * num_k_tiles + kt) * TILES_N + nt) * WARP_SZ + laneId]);
+            const int row = laneId / 4;
+            const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row],
+                                             shared_scales_A[warpId * DIRECT_WARP_M + row]);
+            const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 8],
+                                             shared_scales_A[warpId * DIRECT_WARP_M + row + 8]);
+            const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 16],
+                                             shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
+            const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 24],
+                                             shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
 
-            int p0[4] = {0, 0, 0, 0};
-            int p1[4] = {0, 0, 0, 0};
-            int q0[4] = {0, 0, 0, 0};
-            int q1[4] = {0, 0, 0, 0};
-            mma_s4(af0, uint2{wf.x, wf.y}, p0);
-            mma_s4(af0, uint2{wf.z, wf.w}, p1);
-            mma_s4(af1, uint2{wf.x, wf.y}, q0);
-            mma_s4(af1, uint2{wf.z, wf.w}, q1);
+            #pragma unroll
+            for (int nt = 0; nt < TILES_N; nt++) {
+                uint4 wf = load_u4(&B[((bn * num_k_tiles + kt) * TILES_N + nt) * WARP_SZ + laneId]);
 
-            const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
+                int p0[4] = {0, 0, 0, 0};
+                int p1[4] = {0, 0, 0, 0};
+                int q0[4] = {0, 0, 0, 0};
+                int q1[4] = {0, 0, 0, 0};
+                mma_s4(af0, uint2{wf.x, wf.y}, p0);
+                mma_s4(af0, uint2{wf.z, wf.w}, p1);
+                mma_s4(af1, uint2{wf.x, wf.y}, q0);
+                mma_s4(af1, uint2{wf.z, wf.w}, q1);
 
-            const half2 s00 = __hmul2(sa0, sb01);
-            const half2 s01 = __hmul2(sa1, sb01);
-            const half2 s02 = __hmul2(sa0, sb23);
-            const half2 s03 = __hmul2(sa1, sb23);
-            const half2 s10 = __hmul2(sa2, sb01);
-            const half2 s11 = __hmul2(sa3, sb01);
-            const half2 s12 = __hmul2(sa2, sb23);
-            const half2 s13 = __hmul2(sa3, sb23);
+                const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
 
-            const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
-            const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
-            const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
-            const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
-            const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
-            const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
-            const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
-            const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
+                const half2 s00 = __hmul2(sa0, sb01);
+                const half2 s01 = __hmul2(sa1, sb01);
+                const half2 s02 = __hmul2(sa0, sb23);
+                const half2 s03 = __hmul2(sa1, sb23);
+                const half2 s10 = __hmul2(sa2, sb01);
+                const half2 s11 = __hmul2(sa3, sb01);
+                const half2 s12 = __hmul2(sa2, sb23);
+                const half2 s13 = __hmul2(sa3, sb23);
 
-            acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
-            acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
-            acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
-            acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+                const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
+                const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
+                const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
+                const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
+                const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
+                const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
+                const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
+                const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
 
-            acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
-            acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
-            acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
-            acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
+                acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
+                acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
+                acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
+                acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+
+                acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
+                acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
+                acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
+                acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     const int row = laneId / 4;
@@ -401,7 +408,8 @@ __global__ void gemm_int4_direct_kernel_4w(
     half* __restrict__ C,
     int M,
     int N,
-    int num_k_tiles
+    int num_k_tiles,
+    int num_groups_B
 ) {
     const int bn = blockIdx.x;
     const int bm = blockIdx.y;
@@ -422,73 +430,79 @@ __global__ void gemm_int4_direct_kernel_4w(
         }
     }
 
-    for (int kt = 0; kt < num_k_tiles; kt++) {
-        if (tid < DIRECT4_BLOCK_M) {
-            shared_scales_A[tid] = scales_A[(bm * DIRECT4_BLOCK_M + tid) * num_k_tiles + kt];
-        }
+    const int b_scale_stride = num_k_tiles / num_groups_B;
+    for (int bg = 0; bg < num_groups_B; bg++) {
         if (tid < BLOCK_N) {
-            shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_k_tiles + kt];
+            shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_groups_B + bg];
         }
         __syncthreads();
 
-        uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 0) * WARP_SZ + laneId]);
-        uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 1) * WARP_SZ + laneId]);
+        for (int sub = 0; sub < b_scale_stride; sub++) {
+            const int kt = bg * b_scale_stride + sub;
+            if (tid < DIRECT4_BLOCK_M) {
+                shared_scales_A[tid] = scales_A[(bm * DIRECT4_BLOCK_M + tid) * num_k_tiles + kt];
+            }
+            __syncthreads();
 
-        const int row = laneId / 4;
-        const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row],
-                                         shared_scales_A[warpId * DIRECT4_WARP_M + row]);
-        const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 8],
-                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 8]);
-        const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 16],
-                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 16]);
-        const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 24],
-                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 24]);
+            uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 0) * WARP_SZ + laneId]);
+            uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 1) * WARP_SZ + laneId]);
 
-        #pragma unroll
-        for (int nt = 0; nt < TILES_N; nt++) {
-            uint4 wf = load_u4(&B[((bn * num_k_tiles + kt) * TILES_N + nt) * WARP_SZ + laneId]);
+            const int row = laneId / 4;
+            const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row],
+                                             shared_scales_A[warpId * DIRECT4_WARP_M + row]);
+            const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 8],
+                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 8]);
+            const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 16],
+                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 16]);
+            const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 24],
+                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 24]);
 
-            int p0[4] = {0, 0, 0, 0};
-            int p1[4] = {0, 0, 0, 0};
-            int q0[4] = {0, 0, 0, 0};
-            int q1[4] = {0, 0, 0, 0};
-            mma_s4(af0, uint2{wf.x, wf.y}, p0);
-            mma_s4(af0, uint2{wf.z, wf.w}, p1);
-            mma_s4(af1, uint2{wf.x, wf.y}, q0);
-            mma_s4(af1, uint2{wf.z, wf.w}, q1);
+            #pragma unroll
+            for (int nt = 0; nt < TILES_N; nt++) {
+                uint4 wf = load_u4(&B[((bn * num_k_tiles + kt) * TILES_N + nt) * WARP_SZ + laneId]);
 
-            const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
-            const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
+                int p0[4] = {0, 0, 0, 0};
+                int p1[4] = {0, 0, 0, 0};
+                int q0[4] = {0, 0, 0, 0};
+                int q1[4] = {0, 0, 0, 0};
+                mma_s4(af0, uint2{wf.x, wf.y}, p0);
+                mma_s4(af0, uint2{wf.z, wf.w}, p1);
+                mma_s4(af1, uint2{wf.x, wf.y}, q0);
+                mma_s4(af1, uint2{wf.z, wf.w}, q1);
 
-            const half2 s00 = __hmul2(sa0, sb01);
-            const half2 s01 = __hmul2(sa1, sb01);
-            const half2 s02 = __hmul2(sa0, sb23);
-            const half2 s03 = __hmul2(sa1, sb23);
-            const half2 s10 = __hmul2(sa2, sb01);
-            const half2 s11 = __hmul2(sa3, sb01);
-            const half2 s12 = __hmul2(sa2, sb23);
-            const half2 s13 = __hmul2(sa3, sb23);
+                const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
+                const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
 
-            const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
-            const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
-            const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
-            const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
-            const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
-            const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
-            const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
-            const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
+                const half2 s00 = __hmul2(sa0, sb01);
+                const half2 s01 = __hmul2(sa1, sb01);
+                const half2 s02 = __hmul2(sa0, sb23);
+                const half2 s03 = __hmul2(sa1, sb23);
+                const half2 s10 = __hmul2(sa2, sb01);
+                const half2 s11 = __hmul2(sa3, sb01);
+                const half2 s12 = __hmul2(sa2, sb23);
+                const half2 s13 = __hmul2(sa3, sb23);
 
-            acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
-            acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
-            acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
-            acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+                const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
+                const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
+                const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
+                const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
+                const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
+                const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
+                const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
+                const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
 
-            acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
-            acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
-            acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
-            acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
+                acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
+                acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
+                acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
+                acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+
+                acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
+                acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
+                acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
+                acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     const int row = laneId / 4;
@@ -545,7 +559,8 @@ __global__ void gemm_int4_kernel(
     int M,
     int N,
     int K,
-    int group_size
+    int num_groups_A,
+    int num_groups_B
 ) {
     const int bm = blockIdx.y * BLOCK_M;
     const int bn = blockIdx.x * BLOCK_N;
@@ -553,8 +568,9 @@ __global__ void gemm_int4_kernel(
     const int warpId = tid / WARP_SZ;
     const int laneId = tid % WARP_SZ;
     const int halfK = K / 2;
-    const int num_groups = K / group_size;
     const int num_k_tiles = K / BLOCK_K;
+    const int a_scale_stride = num_k_tiles / num_groups_A;
+    const int b_scale_stride = num_k_tiles / num_groups_B;
 
     extern __shared__ uint8_t smem[];
     const int tileA = BLOCK_M * SMEM_STRIDE;
@@ -610,11 +626,12 @@ __global__ void gemm_int4_kernel(
         cp_wait(kt + 1 < num_k_tiles ? 1 : 0);
         __syncthreads();
 
-        int g = (kt * BLOCK_K) / group_size;
+        int gA = kt / a_scale_stride;
+        int gB = kt / b_scale_stride;
         int m_lo = bm + warpId * WARP_M + laneId / 4;
         int m_hi = m_lo + 8;
-        float sa_lo = (m_lo < M) ? __half2float(scales_A[m_lo * num_groups + g]) : 0.f;
-        float sa_hi = (m_hi < M) ? __half2float(scales_A[m_hi * num_groups + g]) : 0.f;
+        float sa_lo = (m_lo < M) ? __half2float(scales_A[m_lo * num_groups_A + gA]) : 0.f;
+        float sa_hi = (m_hi < M) ? __half2float(scales_A[m_hi * num_groups_A + gA]) : 0.f;
 
         uint4 af = load_a_frag(sA[s] + warpId * WARP_M * SMEM_STRIDE, SMEM_STRIDE);
 
@@ -633,10 +650,10 @@ __global__ void gemm_int4_kernel(
             int c1 = c0 + 1;
             int c2 = c0 + 8;
             int c3 = c2 + 1;
-            float sb0 = (c0 < N) ? __half2float(scales_B[c0 * num_groups + g]) : 0.f;
-            float sb1 = (c1 < N) ? __half2float(scales_B[c1 * num_groups + g]) : 0.f;
-            float sb2 = (c2 < N) ? __half2float(scales_B[c2 * num_groups + g]) : 0.f;
-            float sb3 = (c3 < N) ? __half2float(scales_B[c3 * num_groups + g]) : 0.f;
+            float sb0 = (c0 < N) ? __half2float(scales_B[c0 * num_groups_B + gB]) : 0.f;
+            float sb1 = (c1 < N) ? __half2float(scales_B[c1 * num_groups_B + gB]) : 0.f;
+            float sb2 = (c2 < N) ? __half2float(scales_B[c2 * num_groups_B + gB]) : 0.f;
+            float sb3 = (c3 < N) ? __half2float(scales_B[c3 * num_groups_B + gB]) : 0.f;
 
             acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
             acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
@@ -689,17 +706,24 @@ torch::Tensor gemm_int4_custom(
     int M = A_packed.size(0);
     int K = A_packed.size(1) * 2;
     int N = B_packed.size(0);
+    int num_groups_A = scales_A.size(1);
+    int num_groups_B = scales_B.size(1);
+    int group_size_A = K / num_groups_A;
+    int group_size_B = K / num_groups_B;
 
     TORCH_CHECK(B_packed.size(1) * 2 == K, "A and B must have the same K dimension");
-    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
+    TORCH_CHECK(K % group_size_A == 0, "K must be divisible by activation group size");
+    TORCH_CHECK(K % group_size_B == 0, "K must be divisible by weight group size");
 
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
-    const bool use_direct_layout_4w = (group_size == BLOCK_K) &&
+    const bool use_direct_layout_4w = (group_size_A == BLOCK_K) &&
+                                      (group_size_B % BLOCK_K == 0) &&
                                       (K == 3072) &&
                                       (N == 3072) &&
                                       (M % DIRECT4_BLOCK_M == 0);
-    const bool use_direct_layout = (group_size == BLOCK_K) &&
+    const bool use_direct_layout = (group_size_A == BLOCK_K) &&
+                                   (group_size_B % BLOCK_K == 0) &&
                                    (M % DIRECT_BLOCK_M == 0) &&
                                    (N % BLOCK_N == 0) &&
                                    (K % BLOCK_K == 0);
@@ -718,7 +742,8 @@ torch::Tensor gemm_int4_custom(
             reinterpret_cast<half*>(C.data_ptr<at::Half>()),
             M,
             N,
-            K / BLOCK_K
+            K / BLOCK_K,
+            num_groups_B
         );
         return C;
     }
@@ -737,7 +762,8 @@ torch::Tensor gemm_int4_custom(
             reinterpret_cast<half*>(C.data_ptr<at::Half>()),
             M,
             N,
-            K / BLOCK_K
+            K / BLOCK_K,
+            num_groups_B
         );
         return C;
     }
@@ -752,7 +778,7 @@ torch::Tensor gemm_int4_custom(
         reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
         reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-        M, N, K, group_size
+        M, N, K, num_groups_A, num_groups_B
     );
 
     return C;
