@@ -4,19 +4,24 @@ Measured on the remote RTX A6000 benchmark box.
 
 ## Current honest baseline
 
-- Best fair pushed version so far: `e503542`
-- Score: `285.55 TOPs`
+- Best fair pushed version so far: `50b08b6`
+- Score: `319.39 TOPs`
 - Per-layer:
-  - `attn_to_qkv`: `294.91 TOPs`
-  - `attn_to_out`: `283.83 TOPs`
-  - `ff_up`: `288.43 TOPs`
-  - `ff_down`: `275.04 TOPs`
+  - `attn_to_qkv`: `324.02 TOPs`
+  - `attn_to_out`: `300.79 TOPs`
+  - `ff_up`: `317.22 TOPs`
+  - `ff_down`: `335.54 TOPs`
 
 This version uses:
 
 - The direct INT4 path with `half2` accumulation as the main fast path
-- A narrower 4-warp direct kernel only for the `attn_to_out` shape (`4096 x 3072 x 3072`)
-- The older 8-warp direct kernel for the other aligned shapes
+- The 4-warp direct kernel for all benchmarked `K=3072` or `N=3072` shapes
+- Warp-shuffle loads for `scales_A` inside the 4-warp kernel instead of per-tile shared-memory staging
+- Aggressive per-shape offline weight groups:
+  - `attn_to_qkv`: `g512`
+  - `attn_to_out`: `g256`
+  - `ff_up`: `g768`
+  - `ff_down`: `g1536`
 
 ## Negative findings
 
@@ -140,12 +145,92 @@ Trying to shrink the `attn_to_out` specialization from 4 warps to 2 warps was no
   - Drop the 2-warp path for now
   - It is not a quick win and is likely to waste more time than it saves
 
+## Fair progress after the `298.25` baseline
+
+These are the main steps that moved the score past `300` on full default benchmark runs.
+
+### Dispatch changes
+
+- `e8e7d07`:
+  - `298.25 TOPs`
+  - Mixed weight groups plus separate activation/weight group handling in the runtime
+
+- `9acc711`:
+  - `303.27 TOPs`
+  - Expanded the 4-warp direct kernel to all `N=3072` shapes
+  - Big gain on `ff_down`, but not yet enough to cleanly lift every `K=3072` layer
+
+- `7097590`:
+  - `306.57 TOPs`
+  - Narrower split: keep the 4-warp path on `N=3072` shapes and add it to `attn_to_qkv`, but not `ff_up`
+  - This was the first clean `306+` fair full-run result
+
+- `df40404`:
+  - `309.21 TOPs`
+  - With the stronger weight map below, using the 4-warp path for all `K=3072` and `N=3072` shapes became net positive
+
+### Weight-group changes
+
+- `ef52566`:
+  - `308.25 TOPs`
+  - More aggressive per-shape weight groups:
+    - `attn_to_qkv=g512`
+    - `attn_to_out=g256`
+    - `ff_up=g768`
+    - `ff_down=g1024`
+
+- `50b08b6`:
+  - `319.39 TOPs`
+  - Push `ff_down` further to `g1536`
+  - This still clears correctness, but only barely:
+    - `ff_down cosine = 0.977204`
+    - threshold is `0.977`
+
+### Kernel-internal change that mattered most
+
+- `48abb32`:
+  - `316.68 TOPs`
+  - Replace shared-memory `scales_A` loads in the 4-warp direct kernel with warp-local loads plus `__shfl_sync`
+  - This removes a per-`kt` shared-memory barrier for the 4-warp path
+  - This was the biggest single fair kernel win after the initial mixed-group work
+
+## Recent negative findings after `306+`
+
+These are newer dead ends or marginal directions that should not be repeated without a different underlying idea.
+
+- Broad 4-warp expansion before the later kernel/weight-map wins:
+  - Short run looked strong at about `307.96 TOPs`
+  - Full run only landed around `303.58 TOPs`
+  - Conclusion: short runs were overestimating this variant at that stage
+
+- `ff_up` at `g1024`:
+  - Passed correctness, but only narrowly:
+    - `ff_up cosine = 0.978154`
+    - threshold is `0.978`
+  - Short run landed around `319.05 TOPs`
+  - Worse than the current best pushed baseline
+  - Conclusion: not worth the reduced correctness margin
+
+- `attn_to_qkv` at `g768`:
+  - Passed correctness, but also narrowly:
+    - `attn_to_qkv cosine = 0.989350`
+    - threshold is `0.989`
+  - Short run landed around `320.21 TOPs`
+  - Too little upside for how close it runs to the floor
+  - Conclusion: keep `attn_to_qkv` at `g512`
+
+- More aggressive weight grouping in general:
+  - The current best build is already using most of the safe headroom
+  - The remaining margin is especially tight on `attn_to_out`, `ff_up`, and `ff_down`
+  - Future gains are more likely to come from kernel changes than from another round of coarse grouping
+
 ## What looks most promising next
 
-- A new kernel family for the `K=3072` shapes rather than more micro-tuning of the current direct kernel
-- In particular:
-  - A better `attn_to_qkv` / `ff_up` specialization
-  - A separate `attn_to_out` specialization that improves on the current 4-warp path without shared-memory `B` staging
+- `attn_to_out` is now the laggard layer in the best build
+- The most credible next fair wins are kernel-side, not quantization-side:
+  - Improve the 4-warp direct kernel for the `3072 x 3072` case specifically
+  - Reduce remaining synchronization or scale-lookup overhead in the direct path
+  - Try a shape-specific `attn_to_out` path that is different from the generic all-shapes 4-warp kernel
 
 ## Benchmark structure reminder
 
