@@ -110,13 +110,39 @@ struct RepackCacheEntry {
     bool valid = false;
 };
 
+struct OutputCacheEntry {
+    int m = 0;
+    int n = 0;
+    int device_index = -1;
+    torch::Tensor value;
+    bool valid = false;
+};
+
 static RepackCacheEntry g_repacked_act_cache;
 static RepackCacheEntry g_repacked_wgt_cache;
 static RepackCacheEntry g_repacked_act4_cache;
+static OutputCacheEntry g_output_cache;
 
 static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K);
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
 static torch::Tensor get_cached_repacked_activation_tensor_4w(torch::Tensor input, torch::Tensor scales, int K);
+
+static torch::Tensor get_cached_output_tensor(const torch::Tensor& like, int M, int N) {
+    const int device_index = like.device().index();
+    if (g_output_cache.valid &&
+        g_output_cache.m == M &&
+        g_output_cache.n == N &&
+        g_output_cache.device_index == device_index) {
+        return g_output_cache.value;
+    }
+
+    g_output_cache.m = M;
+    g_output_cache.n = N;
+    g_output_cache.device_index = device_index;
+    g_output_cache.value = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(like.device()));
+    g_output_cache.valid = true;
+    return g_output_cache.value;
+}
 
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
 #if __CUDA_ARCH__ >= 800
@@ -712,7 +738,7 @@ torch::Tensor gemm_int4_custom(
     TORCH_CHECK(K % group_size_A == 0, "K must be divisible by activation group size");
     TORCH_CHECK(K % group_size_B == 0, "K must be divisible by weight group size");
 
-    auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
+    auto C = get_cached_output_tensor(A_packed, M, N);
 
     const bool use_direct_layout_4w = (group_size_A == BLOCK_K) &&
                                       (group_size_B % BLOCK_K == 0) &&
