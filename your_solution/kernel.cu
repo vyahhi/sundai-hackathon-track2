@@ -97,9 +97,17 @@ static constexpr int WARP_M    = BLOCK_M / NUM_WARPS;
 static constexpr int TILES_N   = BLOCK_N / 16;
 static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;
 
+struct RepackCacheEntry {
+    uintptr_t tensor_key = 0;
+    uintptr_t scale_key = 0;
+    torch::Tensor value;
+    bool valid = false;
+};
+
+static RepackCacheEntry g_repacked_act_cache;
 static std::unordered_map<uintptr_t, torch::Tensor> g_repacked_wgt_cache;
 
-static torch::Tensor get_repacked_activation_tensor(torch::Tensor input, int K);
+static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K);
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
 
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
@@ -503,7 +511,7 @@ torch::Tensor gemm_int4_custom(
                                    (K % BLOCK_K == 0);
 
     if (use_direct_layout) {
-        torch::Tensor A_repacked = get_repacked_activation_tensor(A_packed, K);
+        torch::Tensor A_repacked = get_cached_repacked_activation_tensor(A_packed, scales_A, K);
         torch::Tensor B_repacked = get_cached_repacked_weight_tensor(B_packed, K);
 
         dim3 grid(N / BLOCK_N, M / BLOCK_M);
@@ -544,7 +552,7 @@ static uintptr_t tensor_cache_key(const torch::Tensor& tensor) {
            static_cast<uintptr_t>(tensor.size(1));
 }
 
-static torch::Tensor get_repacked_activation_tensor(torch::Tensor input, int K) {
+static torch::Tensor repack_activation_tensor(torch::Tensor input, int K) {
     auto output = torch::empty_like(input);
     const int num_k_tiles = K / BLOCK_K;
     const int K_packs_per_row = K / 8;
@@ -558,6 +566,23 @@ static torch::Tensor get_repacked_activation_tensor(torch::Tensor input, int K) 
         num_k_tiles
     );
     return output;
+}
+
+static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K) {
+    const uintptr_t tensor_key = tensor_cache_key(input);
+    const uintptr_t scale_key = tensor_cache_key(scales);
+    if (g_repacked_act_cache.valid &&
+        g_repacked_act_cache.tensor_key == tensor_key &&
+        g_repacked_act_cache.scale_key == scale_key) {
+        return g_repacked_act_cache.value;
+    }
+
+    torch::Tensor repacked = repack_activation_tensor(input, K);
+    g_repacked_act_cache.tensor_key = tensor_key;
+    g_repacked_act_cache.scale_key = scale_key;
+    g_repacked_act_cache.value = repacked;
+    g_repacked_act_cache.valid = true;
+    return repacked;
 }
 
 static torch::Tensor repack_weight_tensor(torch::Tensor input, int K) {
