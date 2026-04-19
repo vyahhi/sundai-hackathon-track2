@@ -40,6 +40,23 @@ Baselines below are measured on an **NVIDIA RTX A6000** (Ampere, INT4 dense peak
 | MMA starter | ~58 | Copy from `reference/gemm_int4_mma.cu` |
 | Optimized (nunchaku) | ~305 | Target to beat |
 
+## How to run it
+
+We already preinstalled conda on each of the servers and configured the environment called `cuda-challenge`.
+```bash
+source $HOME/miniconda3/etc/profile.d/conda.sh && conda activate cuda-challenge
+```
+
+At first download the data. Make sure the python that you are using is from the `cuda-challenge` environment. 
+```bash
+python download_data.py
+```
+
+Then run the benchmark.
+```bash
+source $HOME/miniconda3/etc/profile.d/conda.sh && conda activate cuda-challenge && python benchmark.py
+``` 
+
 ## Repository Structure
 
 ```
