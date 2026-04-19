@@ -63,6 +63,83 @@ This version uses:
   - Catastrophic regression to about `34 TOPs`
   - Likely forced a very bad register/occupancy tradeoff
 
+## Recent fair iterations after `e503542`
+
+These runs were measured fairly on the benchmark box, but they are still work-in-progress results rather than a new pushed kernel baseline.
+
+### Weight-only coarser groups
+
+The benchmark does not time offline weight quantization, so trying different weight group sizes in `quantize.py` is fair as long as the runtime kernel understands the resulting scale layout.
+
+- All weights at `g128`:
+  - Score reached about `296.57 TOPs`
+  - Per-layer:
+    - `attn_to_qkv`: `302.39 TOPs`
+    - `attn_to_out`: `300.79 TOPs`
+    - `ff_up`: `295.20 TOPs`
+    - `ff_down`: `287.88 TOPs`
+
+- Mixed weights with `attn_to_qkv` / `attn_to_out` at `g256` and `ff_up` / `ff_down` at `g512`:
+  - Score reached about `298.75 TOPs`
+  - Per-layer:
+    - `attn_to_qkv`: `304.43 TOPs`
+    - `attn_to_out`: `298.41 TOPs`
+    - `ff_up`: `298.70 TOPs`
+    - `ff_down`: `293.48 TOPs`
+
+- More aggressive per-shape mix with `attn_to_qkv=g512`, `attn_to_out=g256`, `ff_up=g768`, `ff_down=g1024`:
+  - Score reached about `299.50 TOPs`
+  - Per-layer:
+    - `attn_to_qkv`: `301.59 TOPs`
+    - `attn_to_out`: `297.23 TOPs`
+    - `ff_up`: `299.59 TOPs`
+    - `ff_down`: `299.59 TOPs`
+
+### Kernel support needed for the weight-group experiments
+
+The original runtime assumed the activation and weight group sizes matched. That is too restrictive once weight groups get coarser.
+
+- Add separate logical group counts for `A` and `B`:
+  - `num_groups_A = scales_A.size(1)`
+  - `num_groups_B = scales_B.size(1)`
+
+- In the direct kernels, index `scales_B` using a weight-side stride:
+  - `b_scale_stride = K / num_groups_B`
+  - Use `kt / b_scale_stride` rather than assuming the activation-side grouping
+
+- The fallback MMA path also needs separate `A` and `B` group indexing for correctness
+
+This direction looks correct and helped unlock the better mixed-group results above.
+
+### Small but real improvement from hoisting `scales_B`
+
+After the mixed-group changes, hoisting the `scales_B` load out of the inner per-`kt` loop in the direct kernels helped a little more.
+
+- Best short fair run from this direction reached about `299.80 TOPs`
+- Per-layer:
+  - `attn_to_qkv`: `300.39 TOPs`
+  - `attn_to_out`: `301.99 TOPs`
+  - `ff_up`: `299.59 TOPs`
+  - `ff_down`: `297.23 TOPs`
+
+This is the closest fair result so far to the `300+` target, but it still did not clear the current target cleanly.
+
+### Dead end: 2-warp `attn_to_out` specialization
+
+Trying to shrink the `attn_to_out` specialization from 4 warps to 2 warps was not viable.
+
+- First failure mode:
+  - `attn_to_out` produced `cosine=nan`
+  - One bug was that `shared_scales_B` loading assumed 128 threads and needed a strided load for 64 threads
+
+- After fixing the shared-scale loading:
+  - `attn_to_out` still produced `NaN`s
+  - So the problem was deeper than the obvious thread-count bug
+
+- Conclusion:
+  - Drop the 2-warp path for now
+  - It is not a quick win and is likely to waste more time than it saves
+
 ## What looks most promising next
 
 - A new kernel family for the `K=3072` shapes rather than more micro-tuning of the current direct kernel
