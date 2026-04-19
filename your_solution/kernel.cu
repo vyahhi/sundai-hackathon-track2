@@ -106,21 +106,9 @@ struct RepackCacheEntry {
     bool valid = false;
 };
 
-struct GemmCacheEntry {
-    uintptr_t a_key = 0;
-    uintptr_t b_key = 0;
-    uintptr_t sa_key = 0;
-    uintptr_t sb_key = 0;
-    int group_size = 0;
-    torch::Tensor value;
-    bool valid = false;
-};
-
 static RepackCacheEntry g_repacked_act_cache;
 static RepackCacheEntry g_repacked_wgt_cache;
-static GemmCacheEntry g_gemm_cache;
 
-static uintptr_t tensor_cache_key(const torch::Tensor& tensor);
 static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K);
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
 
@@ -545,19 +533,6 @@ torch::Tensor gemm_int4_custom(
     TORCH_CHECK(B_packed.size(1) * 2 == K, "A and B must have the same K dimension");
     TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
 
-    const uintptr_t a_key = tensor_cache_key(A_packed);
-    const uintptr_t b_key = tensor_cache_key(B_packed);
-    const uintptr_t sa_key = tensor_cache_key(scales_A);
-    const uintptr_t sb_key = tensor_cache_key(scales_B);
-    if (g_gemm_cache.valid &&
-        g_gemm_cache.a_key == a_key &&
-        g_gemm_cache.b_key == b_key &&
-        g_gemm_cache.sa_key == sa_key &&
-        g_gemm_cache.sb_key == sb_key &&
-        g_gemm_cache.group_size == group_size) {
-        return g_gemm_cache.value;
-    }
-
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
     const bool use_direct_layout = (group_size == BLOCK_K) &&
@@ -581,7 +556,6 @@ torch::Tensor gemm_int4_custom(
             N,
             K / BLOCK_K
         );
-        g_gemm_cache = {a_key, b_key, sa_key, sb_key, group_size, C, true};
         return C;
     }
 
@@ -598,7 +572,6 @@ torch::Tensor gemm_int4_custom(
         M, N, K, group_size
     );
 
-    g_gemm_cache = {a_key, b_key, sa_key, sb_key, group_size, C, true};
     return C;
 }
 
