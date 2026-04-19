@@ -97,10 +97,10 @@ static constexpr int WARP_M    = BLOCK_M / NUM_WARPS;
 static constexpr int TILES_N   = BLOCK_N / 16;
 static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;
 
-static std::unordered_map<uintptr_t, torch::Tensor> g_repacked_act_cache;
 static std::unordered_map<uintptr_t, torch::Tensor> g_repacked_wgt_cache;
 
-static torch::Tensor get_cached_repacked_tensor(torch::Tensor input, int K, bool is_weight);
+static torch::Tensor get_repacked_activation_tensor(torch::Tensor input, int K);
+static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
 
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
 #if __CUDA_ARCH__ >= 800
@@ -489,12 +489,11 @@ torch::Tensor gemm_int4_custom(
     const bool use_direct_layout = (group_size == BLOCK_K) &&
                                    (M % BLOCK_M == 0) &&
                                    (N % BLOCK_N == 0) &&
-                                   (K % BLOCK_K == 0) &&
-                                   (K == 3072);
+                                   (K % BLOCK_K == 0);
 
     if (use_direct_layout) {
-        torch::Tensor A_repacked = get_cached_repacked_tensor(A_packed, K, false);
-        torch::Tensor B_repacked = get_cached_repacked_tensor(B_packed, K, true);
+        torch::Tensor A_repacked = get_repacked_activation_tensor(A_packed, K);
+        torch::Tensor B_repacked = get_cached_repacked_weight_tensor(B_packed, K);
 
         dim3 grid(N / BLOCK_N, M / BLOCK_M);
         dim3 block(WARP_SZ * NUM_WARPS);
@@ -530,10 +529,11 @@ torch::Tensor gemm_int4_custom(
 static uintptr_t tensor_cache_key(const torch::Tensor& tensor) {
     return reinterpret_cast<uintptr_t>(tensor.data_ptr()) ^
            (static_cast<uintptr_t>(tensor.device().index() + 1) << 48) ^
-           static_cast<uintptr_t>(tensor.numel());
+           (static_cast<uintptr_t>(tensor.size(0)) << 20) ^
+           static_cast<uintptr_t>(tensor.size(1));
 }
 
-static torch::Tensor repack_activation_tensor(torch::Tensor input, int K) {
+static torch::Tensor get_repacked_activation_tensor(torch::Tensor input, int K) {
     auto output = torch::empty_like(input);
     const int num_k_tiles = K / BLOCK_K;
     const int K_packs_per_row = K / 8;
@@ -565,19 +565,15 @@ static torch::Tensor repack_weight_tensor(torch::Tensor input, int K) {
     return output;
 }
 
-static torch::Tensor get_cached_repacked_tensor(
-    torch::Tensor input,
-    int K,
-    bool is_weight
-) {
-    auto& cache = is_weight ? g_repacked_wgt_cache : g_repacked_act_cache;
+static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K) {
+    auto& cache = g_repacked_wgt_cache;
     const uintptr_t key = tensor_cache_key(input);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
 
-    torch::Tensor repacked = is_weight ? repack_weight_tensor(input, K) : repack_activation_tensor(input, K);
+    torch::Tensor repacked = repack_weight_tensor(input, K);
     cache[key] = repacked;
     return repacked;
 }
