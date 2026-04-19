@@ -418,7 +418,6 @@ __global__ void gemm_int4_direct_kernel_4w(
     const int laneId = tid % WARP_SZ;
 
     const int m_block = bm * DIRECT4_BLOCK_M + warpId * DIRECT4_WARP_M;
-    __shared__ half shared_scales_A[DIRECT4_BLOCK_M];
     __shared__ half shared_scales_B[BLOCK_N];
     half2 acc[DIRECT4_A_TILES][TILES_N][4];
     for (int a = 0; a < DIRECT4_A_TILES; a++) {
@@ -439,23 +438,20 @@ __global__ void gemm_int4_direct_kernel_4w(
 
         for (int sub = 0; sub < b_scale_stride; sub++) {
             const int kt = bg * b_scale_stride + sub;
-            if (tid < DIRECT4_BLOCK_M) {
-                shared_scales_A[tid] = scales_A[(bm * DIRECT4_BLOCK_M + tid) * num_k_tiles + kt];
-            }
-            __syncthreads();
+            const half scale_lane = scales_A[(m_block + laneId) * num_k_tiles + kt];
 
             uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 0) * WARP_SZ + laneId]);
             uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 1) * WARP_SZ + laneId]);
 
             const int row = laneId / 4;
-            const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row],
-                                             shared_scales_A[warpId * DIRECT4_WARP_M + row]);
-            const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 8],
-                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 8]);
-            const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 16],
-                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 16]);
-            const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 24],
-                                             shared_scales_A[warpId * DIRECT4_WARP_M + row + 24]);
+            const half sa0_scalar = __shfl_sync(0xffffffff, scale_lane, row);
+            const half sa1_scalar = __shfl_sync(0xffffffff, scale_lane, row + 8);
+            const half sa2_scalar = __shfl_sync(0xffffffff, scale_lane, row + 16);
+            const half sa3_scalar = __shfl_sync(0xffffffff, scale_lane, row + 24);
+            const half2 sa0 = __halves2half2(sa0_scalar, sa0_scalar);
+            const half2 sa1 = __halves2half2(sa1_scalar, sa1_scalar);
+            const half2 sa2 = __halves2half2(sa2_scalar, sa2_scalar);
+            const half2 sa3 = __halves2half2(sa3_scalar, sa3_scalar);
 
             #pragma unroll
             for (int nt = 0; nt < TILES_N; nt++) {
@@ -501,8 +497,8 @@ __global__ void gemm_int4_direct_kernel_4w(
                 acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
                 acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
             }
-            __syncthreads();
         }
+        __syncthreads();
     }
 
     const int row = laneId / 4;
