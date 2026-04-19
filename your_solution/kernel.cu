@@ -252,15 +252,13 @@ __global__ void gemm_int4_direct_kernel(
     const int m_block = bm * DIRECT_BLOCK_M + warpId * DIRECT_WARP_M;
     __shared__ half shared_scales_A[DIRECT_BLOCK_M];
     __shared__ half shared_scales_B[BLOCK_N];
-    float acc[DIRECT_A_TILES][TILES_N][2][4];
+    half2 acc[DIRECT_A_TILES][TILES_N][4];
     for (int a = 0; a < DIRECT_A_TILES; a++) {
         for (int j = 0; j < TILES_N; j++) {
-            for (int h = 0; h < 2; h++) {
-                acc[a][j][h][0] = 0.f;
-                acc[a][j][h][1] = 0.f;
-                acc[a][j][h][2] = 0.f;
-                acc[a][j][h][3] = 0.f;
-            }
+            acc[a][j][0] = __float2half2_rn(0.f);
+            acc[a][j][1] = __float2half2_rn(0.f);
+            acc[a][j][2] = __float2half2_rn(0.f);
+            acc[a][j][3] = __float2half2_rn(0.f);
         }
     }
 
@@ -277,10 +275,14 @@ __global__ void gemm_int4_direct_kernel(
         uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 1) * WARP_SZ + laneId]);
 
         const int row = laneId / 4;
-        const float sa0 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row]);
-        const float sa1 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 8]);
-        const float sa2 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
-        const float sa3 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
+        const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row],
+                                         shared_scales_A[warpId * DIRECT_WARP_M + row]);
+        const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 8],
+                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 8]);
+        const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 16],
+                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
+        const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 24],
+                                         shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
 
         #pragma unroll
         for (int nt = 0; nt < TILES_N; nt++) {
@@ -295,28 +297,36 @@ __global__ void gemm_int4_direct_kernel(
             mma_s4(af1, uint2{wf.x, wf.y}, q0);
             mma_s4(af1, uint2{wf.z, wf.w}, q1);
 
-            const float sb0 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2]);
-            const float sb1 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 1]);
-            const float sb2 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
-            const float sb3 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 9]);
+            const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
+            const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
 
-            acc[0][nt][0][0] += (float)p0[0] * sa0 * sb0;
-            acc[0][nt][0][1] += (float)p0[1] * sa0 * sb1;
-            acc[0][nt][0][2] += (float)p0[2] * sa1 * sb0;
-            acc[0][nt][0][3] += (float)p0[3] * sa1 * sb1;
-            acc[0][nt][1][0] += (float)p1[0] * sa0 * sb2;
-            acc[0][nt][1][1] += (float)p1[1] * sa0 * sb3;
-            acc[0][nt][1][2] += (float)p1[2] * sa1 * sb2;
-            acc[0][nt][1][3] += (float)p1[3] * sa1 * sb3;
+            const half2 s00 = __hmul2(sa0, sb01);
+            const half2 s01 = __hmul2(sa1, sb01);
+            const half2 s02 = __hmul2(sa0, sb23);
+            const half2 s03 = __hmul2(sa1, sb23);
+            const half2 s10 = __hmul2(sa2, sb01);
+            const half2 s11 = __hmul2(sa3, sb01);
+            const half2 s12 = __hmul2(sa2, sb23);
+            const half2 s13 = __hmul2(sa3, sb23);
 
-            acc[1][nt][0][0] += (float)q0[0] * sa2 * sb0;
-            acc[1][nt][0][1] += (float)q0[1] * sa2 * sb1;
-            acc[1][nt][0][2] += (float)q0[2] * sa3 * sb0;
-            acc[1][nt][0][3] += (float)q0[3] * sa3 * sb1;
-            acc[1][nt][1][0] += (float)q1[0] * sa2 * sb2;
-            acc[1][nt][1][1] += (float)q1[1] * sa2 * sb3;
-            acc[1][nt][1][2] += (float)q1[2] * sa3 * sb2;
-            acc[1][nt][1][3] += (float)q1[3] * sa3 * sb3;
+            const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
+            const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
+            const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
+            const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
+            const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
+            const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
+            const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
+            const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
+
+            acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
+            acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
+            acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
+            acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+
+            acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
+            acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
+            acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
+            acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
         }
         __syncthreads();
     }
@@ -329,17 +339,17 @@ __global__ void gemm_int4_direct_kernel(
     for (int nt = 0; nt < TILES_N; nt++) {
         const int c0 = bn * BLOCK_N + nt * 16 + (laneId % 4) * 2;
         const int c2 = c0 + 8;
-        reinterpret_cast<half2*>(&C[m0 * N + c0])[0] = __floats2half2_rn(acc[0][nt][0][0], acc[0][nt][0][1]);
-        reinterpret_cast<half2*>(&C[m0 * N + c2])[0] = __floats2half2_rn(acc[0][nt][1][0], acc[0][nt][1][1]);
+        reinterpret_cast<half2*>(&C[m0 * N + c0])[0] = acc[0][nt][0];
+        reinterpret_cast<half2*>(&C[m0 * N + c2])[0] = acc[0][nt][2];
 
-        reinterpret_cast<half2*>(&C[m1 * N + c0])[0] = __floats2half2_rn(acc[0][nt][0][2], acc[0][nt][0][3]);
-        reinterpret_cast<half2*>(&C[m1 * N + c2])[0] = __floats2half2_rn(acc[0][nt][1][2], acc[0][nt][1][3]);
+        reinterpret_cast<half2*>(&C[m1 * N + c0])[0] = acc[0][nt][1];
+        reinterpret_cast<half2*>(&C[m1 * N + c2])[0] = acc[0][nt][3];
 
-        reinterpret_cast<half2*>(&C[m2 * N + c0])[0] = __floats2half2_rn(acc[1][nt][0][0], acc[1][nt][0][1]);
-        reinterpret_cast<half2*>(&C[m2 * N + c2])[0] = __floats2half2_rn(acc[1][nt][1][0], acc[1][nt][1][1]);
+        reinterpret_cast<half2*>(&C[m2 * N + c0])[0] = acc[1][nt][0];
+        reinterpret_cast<half2*>(&C[m2 * N + c2])[0] = acc[1][nt][2];
 
-        reinterpret_cast<half2*>(&C[m3 * N + c0])[0] = __floats2half2_rn(acc[1][nt][0][2], acc[1][nt][0][3]);
-        reinterpret_cast<half2*>(&C[m3 * N + c2])[0] = __floats2half2_rn(acc[1][nt][1][2], acc[1][nt][1][3]);
+        reinterpret_cast<half2*>(&C[m3 * N + c0])[0] = acc[1][nt][1];
+        reinterpret_cast<half2*>(&C[m3 * N + c2])[0] = acc[1][nt][3];
     }
 }
 
