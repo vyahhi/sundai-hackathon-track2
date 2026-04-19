@@ -328,29 +328,18 @@ __global__ void gemm_int4_direct_kernel(
     const int m3 = m0 + 24;
     for (int nt = 0; nt < TILES_N; nt++) {
         const int c0 = bn * BLOCK_N + nt * 16 + (laneId % 4) * 2;
-        const int c1 = c0 + 1;
         const int c2 = c0 + 8;
-        const int c3 = c2 + 1;
+        reinterpret_cast<half2*>(&C[m0 * N + c0])[0] = __floats2half2_rn(acc[0][nt][0][0], acc[0][nt][0][1]);
+        reinterpret_cast<half2*>(&C[m0 * N + c2])[0] = __floats2half2_rn(acc[0][nt][1][0], acc[0][nt][1][1]);
 
-        C[m0 * N + c0] = __float2half(acc[0][nt][0][0]);
-        C[m0 * N + c1] = __float2half(acc[0][nt][0][1]);
-        C[m0 * N + c2] = __float2half(acc[0][nt][1][0]);
-        C[m0 * N + c3] = __float2half(acc[0][nt][1][1]);
+        reinterpret_cast<half2*>(&C[m1 * N + c0])[0] = __floats2half2_rn(acc[0][nt][0][2], acc[0][nt][0][3]);
+        reinterpret_cast<half2*>(&C[m1 * N + c2])[0] = __floats2half2_rn(acc[0][nt][1][2], acc[0][nt][1][3]);
 
-        C[m1 * N + c0] = __float2half(acc[0][nt][0][2]);
-        C[m1 * N + c1] = __float2half(acc[0][nt][0][3]);
-        C[m1 * N + c2] = __float2half(acc[0][nt][1][2]);
-        C[m1 * N + c3] = __float2half(acc[0][nt][1][3]);
+        reinterpret_cast<half2*>(&C[m2 * N + c0])[0] = __floats2half2_rn(acc[1][nt][0][0], acc[1][nt][0][1]);
+        reinterpret_cast<half2*>(&C[m2 * N + c2])[0] = __floats2half2_rn(acc[1][nt][1][0], acc[1][nt][1][1]);
 
-        C[m2 * N + c0] = __float2half(acc[1][nt][0][0]);
-        C[m2 * N + c1] = __float2half(acc[1][nt][0][1]);
-        C[m2 * N + c2] = __float2half(acc[1][nt][1][0]);
-        C[m2 * N + c3] = __float2half(acc[1][nt][1][1]);
-
-        C[m3 * N + c0] = __float2half(acc[1][nt][0][2]);
-        C[m3 * N + c1] = __float2half(acc[1][nt][0][3]);
-        C[m3 * N + c2] = __float2half(acc[1][nt][1][2]);
-        C[m3 * N + c3] = __float2half(acc[1][nt][1][3]);
+        reinterpret_cast<half2*>(&C[m3 * N + c0])[0] = __floats2half2_rn(acc[1][nt][0][2], acc[1][nt][0][3]);
+        reinterpret_cast<half2*>(&C[m3 * N + c2])[0] = __floats2half2_rn(acc[1][nt][1][2], acc[1][nt][1][3]);
     }
 }
 
