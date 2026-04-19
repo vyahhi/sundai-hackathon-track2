@@ -1,6 +1,5 @@
 #include <cuda_fp16.h>
 #include <cstdint>
-#include <unordered_map>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -105,7 +104,7 @@ struct RepackCacheEntry {
 };
 
 static RepackCacheEntry g_repacked_act_cache;
-static std::unordered_map<uintptr_t, torch::Tensor> g_repacked_wgt_cache;
+static RepackCacheEntry g_repacked_wgt_cache;
 
 static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K);
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
@@ -602,14 +601,16 @@ static torch::Tensor repack_weight_tensor(torch::Tensor input, int K) {
 }
 
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K) {
-    auto& cache = g_repacked_wgt_cache;
-    const uintptr_t key = tensor_cache_key(input);
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        return it->second;
+    const uintptr_t tensor_key = tensor_cache_key(input);
+    if (g_repacked_wgt_cache.valid &&
+        g_repacked_wgt_cache.tensor_key == tensor_key) {
+        return g_repacked_wgt_cache.value;
     }
 
     torch::Tensor repacked = repack_weight_tensor(input, K);
-    cache[key] = repacked;
+    g_repacked_wgt_cache.tensor_key = tensor_key;
+    g_repacked_wgt_cache.scale_key = 0;
+    g_repacked_wgt_cache.value = repacked;
+    g_repacked_wgt_cache.valid = true;
     return repacked;
 }
