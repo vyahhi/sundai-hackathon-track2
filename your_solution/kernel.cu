@@ -409,10 +409,11 @@ __global__ void gemm_int4_direct_kernel_4w(
     int M,
     int N,
     int num_k_tiles,
-    int num_groups_B
+    int num_groups_B,
+    int swizzle_m_major
 ) {
-    const int bm = blockIdx.x;
-    const int bn = blockIdx.y;
+    const int bm = swizzle_m_major ? blockIdx.x : blockIdx.y;
+    const int bn = swizzle_m_major ? blockIdx.y : blockIdx.x;
     const int tid = threadIdx.x;
     const int warpId = tid / WARP_SZ;
     const int laneId = tid % WARP_SZ;
@@ -727,7 +728,9 @@ torch::Tensor gemm_int4_custom(
         torch::Tensor A_repacked = get_cached_repacked_activation_tensor_4w(A_packed, scales_A, K);
         torch::Tensor B_repacked = get_cached_repacked_weight_tensor(B_packed, K);
 
-        dim3 grid(M / DIRECT4_BLOCK_M, N / BLOCK_N);
+        const bool swizzle_m_major = (K == 3072) && (N > 3072);
+        dim3 grid = swizzle_m_major ? dim3(M / DIRECT4_BLOCK_M, N / BLOCK_N)
+                                    : dim3(N / BLOCK_N, M / DIRECT4_BLOCK_M);
         dim3 block(WARP_SZ * DIRECT4_NUM_WARPS);
         gemm_int4_direct_kernel_4w<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const uint4*>(A_repacked.data_ptr<uint8_t>()),
@@ -738,7 +741,8 @@ torch::Tensor gemm_int4_custom(
             M,
             N,
             K / BLOCK_K,
-            num_groups_B
+            num_groups_B,
+            swizzle_m_major ? 1 : 0
         );
         return C;
     }
