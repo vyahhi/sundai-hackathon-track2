@@ -95,6 +95,9 @@ static constexpr int NUM_WARPS = 8;
 static constexpr int WARP_M    = BLOCK_M / NUM_WARPS;
 static constexpr int TILES_N   = BLOCK_N / 16;
 static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;
+static constexpr int DIRECT_BLOCK_M = 256;
+static constexpr int DIRECT_WARP_M = DIRECT_BLOCK_M / NUM_WARPS;
+static constexpr int DIRECT_A_TILES = DIRECT_WARP_M / 16;
 
 struct RepackCacheEntry {
     uintptr_t tensor_key = 0;
@@ -168,23 +171,26 @@ __global__ void repack_act_layout_kernel(
 
     const int bm = warp_tile / NUM_WARPS;
     const int warp = warp_tile % NUM_WARPS;
-    const int row_base = warp_tile * WARP_M;
-    const int in_base = row_base * K_packs_per_row + kt * 8;
-
-    __shared__ alignas(128) uint32_t mat[WARP_M][8];
+    const int row_base = warp_tile * DIRECT_WARP_M;
+    __shared__ alignas(128) uint32_t mat[16][8];
 
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const int row = i * 4 + lane / 8;
-        const int col = lane % 8;
-        mat[row][col] = input[in_base + row * K_packs_per_row + col];
+    for (int tile = 0; tile < DIRECT_A_TILES; tile++) {
+        const int tile_row_base = row_base + tile * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int row = i * 4 + lane / 8;
+            const int col = lane % 8;
+            mat[row][col] = input[(tile_row_base + row) * K_packs_per_row + kt * 8 + col];
+        }
+        __syncwarp();
+
+        uint4 packed;
+        ldmatrix_x4(&mat[lane % 16][(lane / 16) * 4], packed);
+        output[((((bm * num_k_tiles + kt) * NUM_WARPS + warp) * DIRECT_A_TILES) + tile) * WARP_SZ + lane] = packed;
+        __syncwarp();
     }
-    __syncwarp();
-
-    uint4 packed;
-    ldmatrix_x4(&mat[lane % 16][(lane / 16) * 4], packed);
-
-    output[((bm * num_k_tiles + kt) * NUM_WARPS + warp) * WARP_SZ + lane] = packed;
 }
 
 __global__ void repack_wgt_layout_kernel(
@@ -243,34 +249,38 @@ __global__ void gemm_int4_direct_kernel(
     const int warpId = tid / WARP_SZ;
     const int laneId = tid % WARP_SZ;
 
-    const int m_block = bm * BLOCK_M + warpId * WARP_M;
-    __shared__ half shared_scales_A[BLOCK_M];
+    const int m_block = bm * DIRECT_BLOCK_M + warpId * DIRECT_WARP_M;
+    __shared__ half shared_scales_A[DIRECT_BLOCK_M];
     __shared__ half shared_scales_B[BLOCK_N];
-    float acc[TILES_N][2][4];
-    for (int j = 0; j < TILES_N; j++) {
-        for (int h = 0; h < 2; h++) {
-            acc[j][h][0] = 0.f;
-            acc[j][h][1] = 0.f;
-            acc[j][h][2] = 0.f;
-            acc[j][h][3] = 0.f;
+    float acc[DIRECT_A_TILES][TILES_N][2][4];
+    for (int a = 0; a < DIRECT_A_TILES; a++) {
+        for (int j = 0; j < TILES_N; j++) {
+            for (int h = 0; h < 2; h++) {
+                acc[a][j][h][0] = 0.f;
+                acc[a][j][h][1] = 0.f;
+                acc[a][j][h][2] = 0.f;
+                acc[a][j][h][3] = 0.f;
+            }
         }
     }
 
     for (int kt = 0; kt < num_k_tiles; kt++) {
-        if (tid < BLOCK_M) {
-            shared_scales_A[tid] = scales_A[(bm * BLOCK_M + tid) * num_k_tiles + kt];
+        if (tid < DIRECT_BLOCK_M) {
+            shared_scales_A[tid] = scales_A[(bm * DIRECT_BLOCK_M + tid) * num_k_tiles + kt];
         }
         if (tid < BLOCK_N) {
             shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_k_tiles + kt];
         }
         __syncthreads();
 
-        uint4 af = load_u4(&A[((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * WARP_SZ + laneId]);
+        uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 0) * WARP_SZ + laneId]);
+        uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * DIRECT_A_TILES) + 1) * WARP_SZ + laneId]);
 
-        const int m_lo = m_block + laneId / 4;
-        const int m_hi = m_lo + 8;
-        const float sa_lo = __half2float(shared_scales_A[warpId * WARP_M + laneId / 4]);
-        const float sa_hi = __half2float(shared_scales_A[warpId * WARP_M + laneId / 4 + 8]);
+        const int row = laneId / 4;
+        const float sa0 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row]);
+        const float sa1 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 8]);
+        const float sa2 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
+        const float sa3 = __half2float(shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
 
         #pragma unroll
         for (int nt = 0; nt < TILES_N; nt++) {
@@ -278,47 +288,69 @@ __global__ void gemm_int4_direct_kernel(
 
             int p0[4] = {0, 0, 0, 0};
             int p1[4] = {0, 0, 0, 0};
-            mma_s4(af, uint2{wf.x, wf.y}, p0);
-            mma_s4(af, uint2{wf.z, wf.w}, p1);
+            int q0[4] = {0, 0, 0, 0};
+            int q1[4] = {0, 0, 0, 0};
+            mma_s4(af0, uint2{wf.x, wf.y}, p0);
+            mma_s4(af0, uint2{wf.z, wf.w}, p1);
+            mma_s4(af1, uint2{wf.x, wf.y}, q0);
+            mma_s4(af1, uint2{wf.z, wf.w}, q1);
 
-            const int c0 = bn * BLOCK_N + nt * 16 + (laneId % 4) * 2;
-            const int c1 = c0 + 1;
-            const int c2 = c0 + 8;
-            const int c3 = c2 + 1;
             const float sb0 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2]);
             const float sb1 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 1]);
             const float sb2 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
             const float sb3 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 9]);
 
-            acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
-            acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
-            acc[nt][0][2] += (float)p0[2] * sa_hi * sb0;
-            acc[nt][0][3] += (float)p0[3] * sa_hi * sb1;
-            acc[nt][1][0] += (float)p1[0] * sa_lo * sb2;
-            acc[nt][1][1] += (float)p1[1] * sa_lo * sb3;
-            acc[nt][1][2] += (float)p1[2] * sa_hi * sb2;
-            acc[nt][1][3] += (float)p1[3] * sa_hi * sb3;
+            acc[0][nt][0][0] += (float)p0[0] * sa0 * sb0;
+            acc[0][nt][0][1] += (float)p0[1] * sa0 * sb1;
+            acc[0][nt][0][2] += (float)p0[2] * sa1 * sb0;
+            acc[0][nt][0][3] += (float)p0[3] * sa1 * sb1;
+            acc[0][nt][1][0] += (float)p1[0] * sa0 * sb2;
+            acc[0][nt][1][1] += (float)p1[1] * sa0 * sb3;
+            acc[0][nt][1][2] += (float)p1[2] * sa1 * sb2;
+            acc[0][nt][1][3] += (float)p1[3] * sa1 * sb3;
+
+            acc[1][nt][0][0] += (float)q0[0] * sa2 * sb0;
+            acc[1][nt][0][1] += (float)q0[1] * sa2 * sb1;
+            acc[1][nt][0][2] += (float)q0[2] * sa3 * sb0;
+            acc[1][nt][0][3] += (float)q0[3] * sa3 * sb1;
+            acc[1][nt][1][0] += (float)q1[0] * sa2 * sb2;
+            acc[1][nt][1][1] += (float)q1[1] * sa2 * sb3;
+            acc[1][nt][1][2] += (float)q1[2] * sa3 * sb2;
+            acc[1][nt][1][3] += (float)q1[3] * sa3 * sb3;
         }
         __syncthreads();
     }
 
-    const int m_lo = m_block + laneId / 4;
-    const int m_hi = m_lo + 8;
+    const int row = laneId / 4;
+    const int m0 = m_block + row;
+    const int m1 = m0 + 8;
+    const int m2 = m0 + 16;
+    const int m3 = m0 + 24;
     for (int nt = 0; nt < TILES_N; nt++) {
         const int c0 = bn * BLOCK_N + nt * 16 + (laneId % 4) * 2;
         const int c1 = c0 + 1;
         const int c2 = c0 + 8;
         const int c3 = c2 + 1;
 
-        C[m_lo * N + c0] = __float2half(acc[nt][0][0]);
-        C[m_lo * N + c1] = __float2half(acc[nt][0][1]);
-        C[m_lo * N + c2] = __float2half(acc[nt][1][0]);
-        C[m_lo * N + c3] = __float2half(acc[nt][1][1]);
+        C[m0 * N + c0] = __float2half(acc[0][nt][0][0]);
+        C[m0 * N + c1] = __float2half(acc[0][nt][0][1]);
+        C[m0 * N + c2] = __float2half(acc[0][nt][1][0]);
+        C[m0 * N + c3] = __float2half(acc[0][nt][1][1]);
 
-        C[m_hi * N + c0] = __float2half(acc[nt][0][2]);
-        C[m_hi * N + c1] = __float2half(acc[nt][0][3]);
-        C[m_hi * N + c2] = __float2half(acc[nt][1][2]);
-        C[m_hi * N + c3] = __float2half(acc[nt][1][3]);
+        C[m1 * N + c0] = __float2half(acc[0][nt][0][2]);
+        C[m1 * N + c1] = __float2half(acc[0][nt][0][3]);
+        C[m1 * N + c2] = __float2half(acc[0][nt][1][2]);
+        C[m1 * N + c3] = __float2half(acc[0][nt][1][3]);
+
+        C[m2 * N + c0] = __float2half(acc[1][nt][0][0]);
+        C[m2 * N + c1] = __float2half(acc[1][nt][0][1]);
+        C[m2 * N + c2] = __float2half(acc[1][nt][1][0]);
+        C[m2 * N + c3] = __float2half(acc[1][nt][1][1]);
+
+        C[m3 * N + c0] = __float2half(acc[1][nt][0][2]);
+        C[m3 * N + c1] = __float2half(acc[1][nt][0][3]);
+        C[m3 * N + c2] = __float2half(acc[1][nt][1][2]);
+        C[m3 * N + c3] = __float2half(acc[1][nt][1][3]);
     }
 }
 
@@ -505,7 +537,7 @@ torch::Tensor gemm_int4_custom(
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
     const bool use_direct_layout = (group_size == BLOCK_K) &&
-                                   (M % BLOCK_M == 0) &&
+                                   (M % DIRECT_BLOCK_M == 0) &&
                                    (N % BLOCK_N == 0) &&
                                    (K % BLOCK_K == 0);
 
@@ -513,7 +545,7 @@ torch::Tensor gemm_int4_custom(
         torch::Tensor A_repacked = get_cached_repacked_activation_tensor(A_packed, scales_A, K);
         torch::Tensor B_repacked = get_cached_repacked_weight_tensor(B_packed, K);
 
-        dim3 grid(N / BLOCK_N, M / BLOCK_M);
+        dim3 grid(N / BLOCK_N, M / DIRECT_BLOCK_M);
         dim3 block(WARP_SZ * NUM_WARPS);
         gemm_int4_direct_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const uint4*>(A_repacked.data_ptr<uint8_t>()),
@@ -557,7 +589,7 @@ static torch::Tensor repack_activation_tensor(torch::Tensor input, int K) {
     const int K_packs_per_row = K / 8;
 
     dim3 block(WARP_SZ);
-    dim3 grid(input.size(0) / WARP_M, num_k_tiles);
+    dim3 grid(input.size(0) / DIRECT_WARP_M, num_k_tiles);
     repack_act_layout_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const uint32_t*>(input.data_ptr<uint8_t>()),
         reinterpret_cast<uint4*>(output.data_ptr<uint8_t>()),
