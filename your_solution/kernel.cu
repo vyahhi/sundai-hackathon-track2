@@ -237,6 +237,8 @@ __global__ void gemm_int4_direct_kernel(
     const int laneId = tid % WARP_SZ;
 
     const int m_block = bm * BLOCK_M + warpId * WARP_M;
+    __shared__ half shared_scales_A[BLOCK_M];
+    __shared__ half shared_scales_B[BLOCK_N];
     float acc[TILES_N][2][4];
     for (int j = 0; j < TILES_N; j++) {
         for (int h = 0; h < 2; h++) {
@@ -248,12 +250,20 @@ __global__ void gemm_int4_direct_kernel(
     }
 
     for (int kt = 0; kt < num_k_tiles; kt++) {
+        if (tid < BLOCK_M) {
+            shared_scales_A[tid] = scales_A[(bm * BLOCK_M + tid) * num_k_tiles + kt];
+        }
+        if (tid < BLOCK_N) {
+            shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_k_tiles + kt];
+        }
+        __syncthreads();
+
         uint4 af = load_u4(&A[((bm * num_k_tiles + kt) * NUM_WARPS + warpId) * WARP_SZ + laneId]);
 
         const int m_lo = m_block + laneId / 4;
         const int m_hi = m_lo + 8;
-        const float sa_lo = __half2float(scales_A[m_lo * num_k_tiles + kt]);
-        const float sa_hi = __half2float(scales_A[m_hi * num_k_tiles + kt]);
+        const float sa_lo = __half2float(shared_scales_A[warpId * WARP_M + laneId / 4]);
+        const float sa_hi = __half2float(shared_scales_A[warpId * WARP_M + laneId / 4 + 8]);
 
         #pragma unroll
         for (int nt = 0; nt < TILES_N; nt++) {
@@ -268,10 +278,10 @@ __global__ void gemm_int4_direct_kernel(
             const int c1 = c0 + 1;
             const int c2 = c0 + 8;
             const int c3 = c2 + 1;
-            const float sb0 = __half2float(scales_B[c0 * num_k_tiles + kt]);
-            const float sb1 = __half2float(scales_B[c1 * num_k_tiles + kt]);
-            const float sb2 = __half2float(scales_B[c2 * num_k_tiles + kt]);
-            const float sb3 = __half2float(scales_B[c3 * num_k_tiles + kt]);
+            const float sb0 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2]);
+            const float sb1 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 1]);
+            const float sb2 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
+            const float sb3 = __half2float(shared_scales_B[nt * 16 + (laneId % 4) * 2 + 9]);
 
             acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
             acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
@@ -282,6 +292,7 @@ __global__ void gemm_int4_direct_kernel(
             acc[nt][1][2] += (float)p1[2] * sa_hi * sb2;
             acc[nt][1][3] += (float)p1[3] * sa_hi * sb3;
         }
+        __syncthreads();
     }
 
     const int m_lo = m_block + laneId / 4;
