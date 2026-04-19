@@ -98,6 +98,10 @@ static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;
 static constexpr int DIRECT_BLOCK_M = 256;
 static constexpr int DIRECT_WARP_M = DIRECT_BLOCK_M / NUM_WARPS;
 static constexpr int DIRECT_A_TILES = DIRECT_WARP_M / 16;
+static constexpr int DIRECT4_BLOCK_M = 128;
+static constexpr int DIRECT4_NUM_WARPS = 4;
+static constexpr int DIRECT4_WARP_M = DIRECT4_BLOCK_M / DIRECT4_NUM_WARPS;
+static constexpr int DIRECT4_A_TILES = DIRECT4_WARP_M / 16;
 
 struct RepackCacheEntry {
     uintptr_t tensor_key = 0;
@@ -108,9 +112,11 @@ struct RepackCacheEntry {
 
 static RepackCacheEntry g_repacked_act_cache;
 static RepackCacheEntry g_repacked_wgt_cache;
+static RepackCacheEntry g_repacked_act4_cache;
 
 static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K);
 static torch::Tensor get_cached_repacked_weight_tensor(torch::Tensor input, int K);
+static torch::Tensor get_cached_repacked_activation_tensor_4w(torch::Tensor input, torch::Tensor scales, int K);
 
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
 #if __CUDA_ARCH__ >= 800
@@ -189,6 +195,40 @@ __global__ void repack_act_layout_kernel(
         uint4 packed;
         ldmatrix_x4(&mat[lane % 16][(lane / 16) * 4], packed);
         output[((((bm * num_k_tiles + kt) * NUM_WARPS + warp) * DIRECT_A_TILES) + tile) * WARP_SZ + lane] = packed;
+        __syncwarp();
+    }
+}
+
+__global__ void repack_act_layout_kernel_4w(
+    const uint32_t* __restrict__ input,
+    uint4* __restrict__ output,
+    int K_packs_per_row,
+    int num_k_tiles
+) {
+    const int lane = threadIdx.x;
+    const int warp_tile = blockIdx.x;
+    const int kt = blockIdx.y;
+
+    const int bm = warp_tile / DIRECT4_NUM_WARPS;
+    const int warp = warp_tile % DIRECT4_NUM_WARPS;
+    const int row_base = warp_tile * DIRECT4_WARP_M;
+    __shared__ alignas(128) uint32_t mat[16][8];
+
+    #pragma unroll
+    for (int tile = 0; tile < DIRECT4_A_TILES; tile++) {
+        const int tile_row_base = row_base + tile * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int row = i * 4 + lane / 8;
+            const int col = lane % 8;
+            mat[row][col] = input[(tile_row_base + row) * K_packs_per_row + kt * 8 + col];
+        }
+        __syncwarp();
+
+        uint4 packed;
+        ldmatrix_x4(&mat[lane % 16][(lane / 16) * 4], packed);
+        output[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warp) * DIRECT4_A_TILES) + tile) * WARP_SZ + lane] = packed;
         __syncwarp();
     }
 }
@@ -283,6 +323,126 @@ __global__ void gemm_int4_direct_kernel(
                                          shared_scales_A[warpId * DIRECT_WARP_M + row + 16]);
         const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT_WARP_M + row + 24],
                                          shared_scales_A[warpId * DIRECT_WARP_M + row + 24]);
+
+        #pragma unroll
+        for (int nt = 0; nt < TILES_N; nt++) {
+            uint4 wf = load_u4(&B[((bn * num_k_tiles + kt) * TILES_N + nt) * WARP_SZ + laneId]);
+
+            int p0[4] = {0, 0, 0, 0};
+            int p1[4] = {0, 0, 0, 0};
+            int q0[4] = {0, 0, 0, 0};
+            int q1[4] = {0, 0, 0, 0};
+            mma_s4(af0, uint2{wf.x, wf.y}, p0);
+            mma_s4(af0, uint2{wf.z, wf.w}, p1);
+            mma_s4(af1, uint2{wf.x, wf.y}, q0);
+            mma_s4(af1, uint2{wf.z, wf.w}, q1);
+
+            const half2 sb01 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2]);
+            const half2 sb23 = *reinterpret_cast<const half2*>(&shared_scales_B[nt * 16 + (laneId % 4) * 2 + 8]);
+
+            const half2 s00 = __hmul2(sa0, sb01);
+            const half2 s01 = __hmul2(sa1, sb01);
+            const half2 s02 = __hmul2(sa0, sb23);
+            const half2 s03 = __hmul2(sa1, sb23);
+            const half2 s10 = __hmul2(sa2, sb01);
+            const half2 s11 = __hmul2(sa3, sb01);
+            const half2 s12 = __hmul2(sa2, sb23);
+            const half2 s13 = __hmul2(sa3, sb23);
+
+            const half2 p0_lo = __floats2half2_rn((float)p0[0], (float)p0[1]);
+            const half2 p0_hi = __floats2half2_rn((float)p0[2], (float)p0[3]);
+            const half2 p1_lo = __floats2half2_rn((float)p1[0], (float)p1[1]);
+            const half2 p1_hi = __floats2half2_rn((float)p1[2], (float)p1[3]);
+            const half2 q0_lo = __floats2half2_rn((float)q0[0], (float)q0[1]);
+            const half2 q0_hi = __floats2half2_rn((float)q0[2], (float)q0[3]);
+            const half2 q1_lo = __floats2half2_rn((float)q1[0], (float)q1[1]);
+            const half2 q1_hi = __floats2half2_rn((float)q1[2], (float)q1[3]);
+
+            acc[0][nt][0] = __hfma2(p0_lo, s00, acc[0][nt][0]);
+            acc[0][nt][1] = __hfma2(p0_hi, s01, acc[0][nt][1]);
+            acc[0][nt][2] = __hfma2(p1_lo, s02, acc[0][nt][2]);
+            acc[0][nt][3] = __hfma2(p1_hi, s03, acc[0][nt][3]);
+
+            acc[1][nt][0] = __hfma2(q0_lo, s10, acc[1][nt][0]);
+            acc[1][nt][1] = __hfma2(q0_hi, s11, acc[1][nt][1]);
+            acc[1][nt][2] = __hfma2(q1_lo, s12, acc[1][nt][2]);
+            acc[1][nt][3] = __hfma2(q1_hi, s13, acc[1][nt][3]);
+        }
+        __syncthreads();
+    }
+
+    const int row = laneId / 4;
+    const int m0 = m_block + row;
+    const int m1 = m0 + 8;
+    const int m2 = m0 + 16;
+    const int m3 = m0 + 24;
+    for (int nt = 0; nt < TILES_N; nt++) {
+        const int c0 = bn * BLOCK_N + nt * 16 + (laneId % 4) * 2;
+        const int c2 = c0 + 8;
+        reinterpret_cast<half2*>(&C[m0 * N + c0])[0] = acc[0][nt][0];
+        reinterpret_cast<half2*>(&C[m0 * N + c2])[0] = acc[0][nt][2];
+
+        reinterpret_cast<half2*>(&C[m1 * N + c0])[0] = acc[0][nt][1];
+        reinterpret_cast<half2*>(&C[m1 * N + c2])[0] = acc[0][nt][3];
+
+        reinterpret_cast<half2*>(&C[m2 * N + c0])[0] = acc[1][nt][0];
+        reinterpret_cast<half2*>(&C[m2 * N + c2])[0] = acc[1][nt][2];
+
+        reinterpret_cast<half2*>(&C[m3 * N + c0])[0] = acc[1][nt][1];
+        reinterpret_cast<half2*>(&C[m3 * N + c2])[0] = acc[1][nt][3];
+    }
+}
+
+__global__ void gemm_int4_direct_kernel_4w(
+    const uint4* __restrict__ A,
+    const uint4* __restrict__ B,
+    const half* __restrict__ scales_A,
+    const half* __restrict__ scales_B,
+    half* __restrict__ C,
+    int M,
+    int N,
+    int num_k_tiles
+) {
+    const int bn = blockIdx.x;
+    const int bm = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warpId = tid / WARP_SZ;
+    const int laneId = tid % WARP_SZ;
+
+    const int m_block = bm * DIRECT4_BLOCK_M + warpId * DIRECT4_WARP_M;
+    __shared__ half shared_scales_A[DIRECT4_BLOCK_M];
+    __shared__ half shared_scales_B[BLOCK_N];
+    half2 acc[DIRECT4_A_TILES][TILES_N][4];
+    for (int a = 0; a < DIRECT4_A_TILES; a++) {
+        for (int j = 0; j < TILES_N; j++) {
+            acc[a][j][0] = __float2half2_rn(0.f);
+            acc[a][j][1] = __float2half2_rn(0.f);
+            acc[a][j][2] = __float2half2_rn(0.f);
+            acc[a][j][3] = __float2half2_rn(0.f);
+        }
+    }
+
+    for (int kt = 0; kt < num_k_tiles; kt++) {
+        if (tid < DIRECT4_BLOCK_M) {
+            shared_scales_A[tid] = scales_A[(bm * DIRECT4_BLOCK_M + tid) * num_k_tiles + kt];
+        }
+        if (tid < BLOCK_N) {
+            shared_scales_B[tid] = scales_B[(bn * BLOCK_N + tid) * num_k_tiles + kt];
+        }
+        __syncthreads();
+
+        uint4 af0 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 0) * WARP_SZ + laneId]);
+        uint4 af1 = load_u4(&A[((((bm * num_k_tiles + kt) * DIRECT4_NUM_WARPS + warpId) * DIRECT4_A_TILES) + 1) * WARP_SZ + laneId]);
+
+        const int row = laneId / 4;
+        const half2 sa0 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row],
+                                         shared_scales_A[warpId * DIRECT4_WARP_M + row]);
+        const half2 sa1 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 8],
+                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 8]);
+        const half2 sa2 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 16],
+                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 16]);
+        const half2 sa3 = __halves2half2(shared_scales_A[warpId * DIRECT4_WARP_M + row + 24],
+                                         shared_scales_A[warpId * DIRECT4_WARP_M + row + 24]);
 
         #pragma unroll
         for (int nt = 0; nt < TILES_N; nt++) {
@@ -535,10 +695,33 @@ torch::Tensor gemm_int4_custom(
 
     auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
+    const bool use_direct_layout_4w = (group_size == BLOCK_K) &&
+                                      (M % DIRECT4_BLOCK_M == 0) &&
+                                      (N % BLOCK_N == 0) &&
+                                      (K % BLOCK_K == 0);
     const bool use_direct_layout = (group_size == BLOCK_K) &&
                                    (M % DIRECT_BLOCK_M == 0) &&
                                    (N % BLOCK_N == 0) &&
                                    (K % BLOCK_K == 0);
+
+    if (use_direct_layout_4w) {
+        torch::Tensor A_repacked = get_cached_repacked_activation_tensor_4w(A_packed, scales_A, K);
+        torch::Tensor B_repacked = get_cached_repacked_weight_tensor(B_packed, K);
+
+        dim3 grid(N / BLOCK_N, M / DIRECT4_BLOCK_M);
+        dim3 block(WARP_SZ * DIRECT4_NUM_WARPS);
+        gemm_int4_direct_kernel_4w<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const uint4*>(A_repacked.data_ptr<uint8_t>()),
+            reinterpret_cast<const uint4*>(B_repacked.data_ptr<uint8_t>()),
+            reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+            M,
+            N,
+            K / BLOCK_K
+        );
+        return C;
+    }
 
     if (use_direct_layout) {
         torch::Tensor A_repacked = get_cached_repacked_activation_tensor(A_packed, scales_A, K);
@@ -598,6 +781,22 @@ static torch::Tensor repack_activation_tensor(torch::Tensor input, int K) {
     return output;
 }
 
+static torch::Tensor repack_activation_tensor_4w(torch::Tensor input, int K) {
+    auto output = torch::empty_like(input);
+    const int num_k_tiles = K / BLOCK_K;
+    const int K_packs_per_row = K / 8;
+
+    dim3 block(WARP_SZ);
+    dim3 grid(input.size(0) / DIRECT4_WARP_M, num_k_tiles);
+    repack_act_layout_kernel_4w<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const uint32_t*>(input.data_ptr<uint8_t>()),
+        reinterpret_cast<uint4*>(output.data_ptr<uint8_t>()),
+        K_packs_per_row,
+        num_k_tiles
+    );
+    return output;
+}
+
 static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, torch::Tensor scales, int K) {
     const uintptr_t tensor_key = tensor_cache_key(input);
     const uintptr_t scale_key = tensor_cache_key(scales);
@@ -612,6 +811,23 @@ static torch::Tensor get_cached_repacked_activation_tensor(torch::Tensor input, 
     g_repacked_act_cache.scale_key = scale_key;
     g_repacked_act_cache.value = repacked;
     g_repacked_act_cache.valid = true;
+    return repacked;
+}
+
+static torch::Tensor get_cached_repacked_activation_tensor_4w(torch::Tensor input, torch::Tensor scales, int K) {
+    const uintptr_t tensor_key = tensor_cache_key(input);
+    const uintptr_t scale_key = tensor_cache_key(scales);
+    if (g_repacked_act4_cache.valid &&
+        g_repacked_act4_cache.tensor_key == tensor_key &&
+        g_repacked_act4_cache.scale_key == scale_key) {
+        return g_repacked_act4_cache.value;
+    }
+
+    torch::Tensor repacked = repack_activation_tensor_4w(input, K);
+    g_repacked_act4_cache.tensor_key = tensor_key;
+    g_repacked_act4_cache.scale_key = scale_key;
+    g_repacked_act4_cache.value = repacked;
+    g_repacked_act4_cache.valid = true;
     return repacked;
 }
 
