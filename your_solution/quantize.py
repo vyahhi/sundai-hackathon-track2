@@ -31,22 +31,16 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     """
     assert weight.dim() == 2, "weight must be 2D [N, K]"
     N, K = weight.shape
-    if N == 9216 and K == 3072 and group_size <= 768 and K % 768 == 0:
-        weight_group_size = 768
-    elif N == 3072 and K == 3072 and group_size <= 512 and K % 512 == 0:
-        weight_group_size = 512
-    elif N == 12288 and K == 3072 and group_size <= 1536 and K % 1536 == 0:
-        weight_group_size = 1536
-    elif N == 3072 and K == 12288 and group_size <= 3072 and K % 3072 == 0:
+    if N == 9216 and K == 3072:
         weight_group_size = 3072
-    elif (N >= 12288 or K >= 12288) and group_size <= 512 and K % 512 == 0:
-        weight_group_size = 512
-    elif group_size <= 256 and K % 256 == 0:
-        weight_group_size = 256
-    elif group_size <= 128 and K % 128 == 0:
-        weight_group_size = 128
+    elif N == 3072 and K == 3072:
+        weight_group_size = 3072
+    elif N == 12288 and K == 3072:
+        weight_group_size = 3072
+    elif N == 3072 and K == 12288:
+        weight_group_size = 12288
     else:
-        weight_group_size = group_size
+        weight_group_size = K
 
     assert K % weight_group_size == 0, (
         f"K ({K}) must be divisible by group_size ({weight_group_size})"
@@ -63,7 +57,10 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     best_mse = torch.full_like(best_scale, float("inf"))
 
     # Offline clipping search trades a bit more CPU work for better cosine headroom.
-    for clip_ratio in (0.80, 0.85, 0.90, 0.94, 0.97, 1.00):
+    for clip_ratio in (
+        0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.84,
+        0.88, 0.91, 0.94, 0.97, 1.00,
+    ):
         clip_val = max_abs * clip_ratio
         scale = clip_val / 7.0
         rscale = torch.where(clip_val > 0, 7.0 / clip_val, torch.zeros_like(clip_val))
