@@ -37,8 +37,8 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
         weight_group_size = 256
     elif N == 12288 and K == 3072 and group_size <= 768 and K % 768 == 0:
         weight_group_size = 768
-    elif N == 3072 and K == 12288 and group_size <= 1024 and K % 1024 == 0:
-        weight_group_size = 1024
+    elif N == 3072 and K == 12288 and group_size <= 1536 and K % 1536 == 0:
+        weight_group_size = 1536
     elif (N >= 12288 or K >= 12288) and group_size <= 512 and K % 512 == 0:
         weight_group_size = 512
     elif group_size <= 256 and K % 256 == 0:
