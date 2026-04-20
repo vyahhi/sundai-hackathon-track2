@@ -4,25 +4,25 @@
 #include <c10/cuda/CUDAStream.h>
 
 // INT4 Quantization Kernel
+static constexpr int ACT_GROUP_SIZE = 64;
 
 __global__ void quantize_int4_kernel(
     const half* __restrict__ input,
     uint8_t* __restrict__ output,
     half* __restrict__ scales,
     int M,
-    int K,
-    int group_size
+    int K
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int group = blockIdx.y;
 
     if (row >= M) return;
 
-    int num_groups = K / group_size;
-    int k_start = group * group_size;
+    int num_groups = K / ACT_GROUP_SIZE;
+    int k_start = group * ACT_GROUP_SIZE;
 
     float max_abs = 0.0f;
-    for (int i = 0; i < group_size; i++) {
+    for (int i = 0; i < ACT_GROUP_SIZE; i++) {
         float val = __half2float(input[row * K + k_start + i]);
         float abs_val = fabsf(val);
         if (abs_val > max_abs) max_abs = abs_val;
@@ -33,7 +33,7 @@ __global__ void quantize_int4_kernel(
     float rscale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
 
     int out_offset = row * (K / 2) + k_start / 2;
-    for (int i = 0; i < group_size; i += 2) {
+    for (int i = 0; i < ACT_GROUP_SIZE; i += 2) {
         float val_even = __half2float(input[row * K + k_start + i]);
         float val_odd = __half2float(input[row * K + k_start + i + 1]);
 
@@ -56,14 +56,14 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
     int M = input.size(0);
     int K = input.size(1);
 
-    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
-    TORCH_CHECK(group_size % 2 == 0, "group_size must be even");
+    TORCH_CHECK(group_size == ACT_GROUP_SIZE, "submission kernel expects activation group size 64");
+    TORCH_CHECK(K % ACT_GROUP_SIZE == 0, "K must be divisible by group_size");
 
     auto output = torch::empty(
         {M, K / 2},
         torch::TensorOptions().dtype(torch::kUInt8).device(input.device())
     );
-    int num_groups = K / group_size;
+    int num_groups = K / ACT_GROUP_SIZE;
     auto scales = torch::empty(
         {M, num_groups},
         torch::TensorOptions().dtype(torch::kHalf).device(input.device())
@@ -77,8 +77,7 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
         output.data_ptr<uint8_t>(),
         reinterpret_cast<half*>(scales.data_ptr<at::Half>()),
         M,
-        K,
-        group_size
+        K
     );
 
     return {output, scales};

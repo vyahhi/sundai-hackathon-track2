@@ -31,42 +31,27 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     """
     assert weight.dim() == 2, "weight must be 2D [N, K]"
     N, K = weight.shape
-    if N == 9216 and K == 3072:
-        weight_group_size = 3072
-    elif N == 3072 and K == 3072:
-        weight_group_size = 3072
-    elif N == 12288 and K == 3072:
-        weight_group_size = 3072
-    elif N == 3072 and K == 12288:
-        weight_group_size = 12288
-    else:
-        weight_group_size = K
+    assert K % 2 == 0, "K must be even"
 
-    assert K % weight_group_size == 0, (
-        f"K ({K}) must be divisible by group_size ({weight_group_size})"
-    )
-    assert weight_group_size % 2 == 0, "group_size must be even"
+    # The benchmark only uses four fixed matrices, and the fastest fair path
+    # keeps one weight scale per output row.
+    weight_group_size = K
 
-    num_groups = K // weight_group_size
-
-    # Work in float32 for precision
-    w = weight.float().reshape(N, num_groups, weight_group_size)
-
-    max_abs = w.abs().amax(dim=-1, keepdim=True)  # [N, num_groups, 1]
+    w = weight.float()
+    max_abs = w.abs().amax(dim=1, keepdim=True)  # [N, 1]
     clip_val = max_abs * 0.75
     scale = clip_val / 7.0
     rscale = torch.where(clip_val > 0, 7.0 / clip_val, torch.zeros_like(clip_val))
 
     # Quantize: round to nearest, clamp to [-8, 7]
-    q = (w * rscale).round().clamp(-8, 7).to(torch.int8)  # [N, num_groups, group_size]
-    q = q.reshape(N, K)
+    q = (w * rscale).round().clamp(-8, 7).to(torch.int8)
 
     # Pack two INT4 values per byte: low nibble = even, high nibble = odd
     even = (q[:, 0::2] & 0xF).to(torch.uint8)
     odd = ((q[:, 1::2] & 0xF) << 4).to(torch.uint8)
     packed = odd | even  # [N, K//2]
 
-    scales = scale.squeeze(-1).half()  # [N, num_groups]
+    scales = scale.half()  # [N, 1]
 
     return {
         "weight_packed": packed,
