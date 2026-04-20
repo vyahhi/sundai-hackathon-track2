@@ -53,27 +53,9 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     w = weight.float().reshape(N, num_groups, weight_group_size)
 
     max_abs = w.abs().amax(dim=-1, keepdim=True)  # [N, num_groups, 1]
-    best_scale = max_abs / 7.0
-    best_mse = torch.full_like(best_scale, float("inf"))
-
-    # Offline clipping search trades a bit more CPU work for better cosine headroom.
-    for clip_ratio in (
-        0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.84,
-        0.88, 0.91, 0.94, 0.97, 1.00,
-    ):
-        clip_val = max_abs * clip_ratio
-        scale = clip_val / 7.0
-        rscale = torch.where(clip_val > 0, 7.0 / clip_val, torch.zeros_like(clip_val))
-
-        q_trial = (w * rscale).round().clamp(-8, 7)
-        reconstructed = q_trial * scale
-        mse = (w - reconstructed).square().mean(dim=-1, keepdim=True)
-
-        improved = mse < best_mse
-        best_mse = torch.where(improved, mse, best_mse)
-        best_scale = torch.where(improved, scale, best_scale)
-
-    rscale = torch.where(best_scale > 0, 1.0 / best_scale, torch.zeros_like(best_scale))
+    clip_val = max_abs * 0.75
+    scale = clip_val / 7.0
+    rscale = torch.where(clip_val > 0, 7.0 / clip_val, torch.zeros_like(clip_val))
 
     # Quantize: round to nearest, clamp to [-8, 7]
     q = (w * rscale).round().clamp(-8, 7).to(torch.int8)  # [N, num_groups, group_size]
@@ -84,7 +66,7 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     odd = ((q[:, 1::2] & 0xF) << 4).to(torch.uint8)
     packed = odd | even  # [N, K//2]
 
-    scales = best_scale.squeeze(-1).half()  # [N, num_groups]
+    scales = scale.squeeze(-1).half()  # [N, num_groups]
 
     return {
         "weight_packed": packed,
